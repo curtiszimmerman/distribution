@@ -1,6 +1,15 @@
-page_title: Work with Notifications
-page_description: Explains how to deploy a registry server
-page_keywords: registry, service, images, repository
+<!--[metadata]>
++++
+title = "Work with Notifications"
+description = "Explains work with registry notifications"
+keywords = ["registry, service, images, notifications,  repository"]
+[menu.main]
+parent="smn_registry"
+weight=5
++++
+<![end-metadata]-->
+
+
 
 # Notifications
 
@@ -27,20 +36,18 @@ order is not guaranteed.
 To setup a registry instance to send notifications to endpoints, one must add
 them to the configuration. A simple example follows:
 
-```yaml
-notifications:
-  endpoints:
-    - name: alistener
-	  url: https://mylistener.example.com/event
-      headers:
-        Authorization: [Bearer <your token, if needed>]
-      timeout: 500ms
-      threshold: 5
-      backoff: 1s
-```
+      notifications:
+        endpoints:
+          - name: alistener
+            url: https://mylistener.example.com/event
+            headers:
+              Authorization: [Bearer <your token, if needed>]
+            timeout: 500ms
+            threshold: 5
+            backoff: 1s
 
 The above would configure the registry with an endpoint to send events to
-"https://mylistener.example.com/event", with the header "Authorization: Bearer
+`https://mylistener.example.com/event`, with the header "Authorization: Bearer
 <your token, if needed>". The request would timeout after 500 milliseconds. If
 5 failures happen consecutively, the registry will backoff for 1 second before
 trying again.
@@ -77,8 +84,9 @@ manifest:
    "action": "push",
    "target": {
       "mediaType": "application/vnd.docker.distribution.manifest.v1+json",
-      "length": 1,
+      "size": 1,
       "digest": "sha256:0123456789abcdef0",
+      "length": 1,
       "repository": "library/test",
       "url": "http://example.com/v2/library/test/manifests/latest"
    },
@@ -97,6 +105,11 @@ manifest:
    }
 }
 ```
+
+> __NOTE(stevvooe):__ As of version 2.1, the `length` field for event targets
+> is being deprecated for the `size` field, bringing the target in line with
+> common nomenclature. Both will continue to be set for the foreseeable
+> future. Newer code should favor `size` but accept either.
 
 ## Envelope
 
@@ -230,7 +243,7 @@ several failures and have since recovered:
 "notifications":{
    "endpoints":[
       {
-         "name":"local-8082",
+         "name":"local-5003",
          "url":"http://localhost:5003/callback",
          "Headers":{
             "Authorization":[

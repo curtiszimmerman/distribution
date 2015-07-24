@@ -9,16 +9,19 @@ import (
 	"os"
 	"time"
 
+	log "github.com/Sirupsen/logrus"
 	"github.com/docker/distribution"
 	"github.com/docker/distribution/configuration"
 	ctxu "github.com/docker/distribution/context"
 	"github.com/docker/distribution/notifications"
+	"github.com/docker/distribution/registry/api/errcode"
 	"github.com/docker/distribution/registry/api/v2"
 	"github.com/docker/distribution/registry/auth"
 	registrymiddleware "github.com/docker/distribution/registry/middleware/registry"
 	repositorymiddleware "github.com/docker/distribution/registry/middleware/repository"
 	"github.com/docker/distribution/registry/storage"
-	"github.com/docker/distribution/registry/storage/cache"
+	memorycache "github.com/docker/distribution/registry/storage/cache/memory"
+	rediscache "github.com/docker/distribution/registry/storage/cache/redis"
 	storagedriver "github.com/docker/distribution/registry/storage/driver"
 	"github.com/docker/distribution/registry/storage/driver/factory"
 	storagemiddleware "github.com/docker/distribution/registry/storage/driver/middleware"
@@ -66,14 +69,14 @@ func NewApp(ctx context.Context, configuration configuration.Configuration) *App
 		return http.HandlerFunc(apiBase)
 	})
 	app.register(v2.RouteNameManifest, imageManifestDispatcher)
+	app.register(v2.RouteNameCatalog, catalogDispatcher)
 	app.register(v2.RouteNameTags, tagsDispatcher)
-	app.register(v2.RouteNameBlob, layerDispatcher)
-	app.register(v2.RouteNameBlobUpload, layerUploadDispatcher)
-	app.register(v2.RouteNameBlobUploadChunk, layerUploadDispatcher)
+	app.register(v2.RouteNameBlob, blobDispatcher)
+	app.register(v2.RouteNameBlobUpload, blobUploadDispatcher)
+	app.register(v2.RouteNameBlobUploadChunk, blobUploadDispatcher)
 
 	var err error
 	app.driver, err = factory.Create(configuration.Storage.Type(), configuration.Storage.Parameters())
-
 	if err != nil {
 		// TODO(stevvooe): Move the creation of a service into a protected
 		// method, where this is created lazily. Its status can be queried via
@@ -81,7 +84,18 @@ func NewApp(ctx context.Context, configuration configuration.Configuration) *App
 		panic(err)
 	}
 
-	startUploadPurger(app.driver, ctxu.GetLogger(app))
+	purgeConfig := uploadPurgeDefaultConfig()
+	if mc, ok := configuration.Storage["maintenance"]; ok {
+		for k, v := range mc {
+			switch k {
+			case "uploadpurging":
+				purgeConfig = v.(map[interface{}]interface{})
+			}
+		}
+
+	}
+
+	startUploadPurger(app, app.driver, ctxu.GetLogger(app), purgeConfig)
 
 	app.driver, err = applyStorageMiddleware(app.driver, configuration.Middleware["storage"])
 	if err != nil {
@@ -90,29 +104,36 @@ func NewApp(ctx context.Context, configuration configuration.Configuration) *App
 
 	app.configureEvents(&configuration)
 	app.configureRedis(&configuration)
+	app.configureLogHook(&configuration)
 
 	// configure storage caches
 	if cc, ok := configuration.Storage["cache"]; ok {
-		switch cc["layerinfo"] {
+		v, ok := cc["blobdescriptor"]
+		if !ok {
+			// Backwards compatible: "layerinfo" == "blobdescriptor"
+			v = cc["layerinfo"]
+		}
+
+		switch v {
 		case "redis":
 			if app.redis == nil {
 				panic("redis configuration required to use for layerinfo cache")
 			}
-			app.registry = storage.NewRegistryWithDriver(app.driver, cache.NewRedisLayerInfoCache(app.redis))
-			ctxu.GetLogger(app).Infof("using redis layerinfo cache")
+			app.registry = storage.NewRegistryWithDriver(app, app.driver, rediscache.NewRedisBlobDescriptorCacheProvider(app.redis))
+			ctxu.GetLogger(app).Infof("using redis blob descriptor cache")
 		case "inmemory":
-			app.registry = storage.NewRegistryWithDriver(app.driver, cache.NewInMemoryLayerInfoCache())
-			ctxu.GetLogger(app).Infof("using inmemory layerinfo cache")
+			app.registry = storage.NewRegistryWithDriver(app, app.driver, memorycache.NewInMemoryBlobDescriptorCacheProvider())
+			ctxu.GetLogger(app).Infof("using inmemory blob descriptor cache")
 		default:
-			if cc["layerinfo"] != "" {
-				ctxu.GetLogger(app).Warnf("unkown cache type %q, caching disabled", configuration.Storage["cache"])
+			if v != "" {
+				ctxu.GetLogger(app).Warnf("unknown cache type %q, caching disabled", configuration.Storage["cache"])
 			}
 		}
 	}
 
 	if app.registry == nil {
 		// configure the registry if no cache section is available.
-		app.registry = storage.NewRegistryWithDriver(app.driver, nil)
+		app.registry = storage.NewRegistryWithDriver(app.Context, app.driver, nil)
 	}
 
 	app.registry, err = applyRegistryMiddleware(app.registry, configuration.Middleware["registry"])
@@ -128,6 +149,7 @@ func NewApp(ctx context.Context, configuration configuration.Configuration) *App
 			panic(fmt.Sprintf("unable to configure authorization (%s): %v", authType, err))
 		}
 		app.accessController = accessController
+		ctxu.GetLogger(app).Debugf("configured %q access controller", authType)
 	}
 
 	return app
@@ -274,6 +296,31 @@ func (app *App) configureRedis(configuration *configuration.Configuration) {
 	}))
 }
 
+// configureLogHook prepares logging hook parameters.
+func (app *App) configureLogHook(configuration *configuration.Configuration) {
+	logger := ctxu.GetLogger(app).(*log.Entry).Logger
+	for _, configHook := range configuration.Log.Hooks {
+		if !configHook.Disabled {
+			switch configHook.Type {
+			case "mail":
+				hook := &logHook{}
+				hook.LevelsParam = configHook.Levels
+				hook.Mail = &mailer{
+					Addr:     configHook.MailOptions.SMTP.Addr,
+					Username: configHook.MailOptions.SMTP.Username,
+					Password: configHook.MailOptions.SMTP.Password,
+					Insecure: configHook.MailOptions.SMTP.Insecure,
+					From:     configHook.MailOptions.From,
+					To:       configHook.MailOptions.To,
+				}
+				logger.Hooks.Add(hook)
+			default:
+			}
+		}
+	}
+	app.Context = ctxu.WithLogger(app.Context, logger)
+}
+
 func (app *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close() // ensure that request body is always closed.
 
@@ -313,7 +360,7 @@ func (app *App) dispatcher(dispatch dispatchFunc) http.Handler {
 		context := app.context(w, r)
 
 		if err := app.authorized(w, r, context); err != nil {
-			ctxu.GetLogger(context).Errorf("error authorizing context: %v", err)
+			ctxu.GetLogger(context).Warnf("error authorizing context: %v", err)
 			return
 		}
 
@@ -328,13 +375,14 @@ func (app *App) dispatcher(dispatch dispatchFunc) http.Handler {
 
 				switch err := err.(type) {
 				case distribution.ErrRepositoryUnknown:
-					context.Errors.Push(v2.ErrorCodeNameUnknown, err)
+					context.Errors = append(context.Errors, v2.ErrorCodeNameUnknown.WithDetail(err))
 				case distribution.ErrRepositoryNameInvalid:
-					context.Errors.Push(v2.ErrorCodeNameInvalid, err)
+					context.Errors = append(context.Errors, v2.ErrorCodeNameInvalid.WithDetail(err))
 				}
 
-				w.WriteHeader(http.StatusBadRequest)
-				serveJSON(w, context.Errors)
+				if err := errcode.ServeJSON(w, context.Errors); err != nil {
+					ctxu.GetLogger(context).Errorf("error serving error json: %v (from %v)", err, context.Errors)
+				}
 				return
 			}
 
@@ -346,36 +394,49 @@ func (app *App) dispatcher(dispatch dispatchFunc) http.Handler {
 			context.Repository, err = applyRepoMiddleware(context.Repository, app.Config.Middleware["repository"])
 			if err != nil {
 				ctxu.GetLogger(context).Errorf("error initializing repository middleware: %v", err)
-				context.Errors.Push(v2.ErrorCodeUnknown, err)
-				w.WriteHeader(http.StatusInternalServerError)
-				serveJSON(w, context.Errors)
+				context.Errors = append(context.Errors, errcode.ErrorCodeUnknown.WithDetail(err))
+
+				if err := errcode.ServeJSON(w, context.Errors); err != nil {
+					ctxu.GetLogger(context).Errorf("error serving error json: %v (from %v)", err, context.Errors)
+				}
 				return
 			}
 		}
 
 		dispatch(context, r).ServeHTTP(w, r)
-
 		// Automated error response handling here. Handlers may return their
 		// own errors if they need different behavior (such as range errors
 		// for layer upload).
 		if context.Errors.Len() > 0 {
-			if context.Value("http.response.status") == 0 {
-				// TODO(stevvooe): Getting this value from the context is a
-				// bit of a hack. We can further address with some of our
-				// future refactoring.
-				w.WriteHeader(http.StatusBadRequest)
-			}
 			app.logError(context, context.Errors)
-			serveJSON(w, context.Errors)
+
+			if err := errcode.ServeJSON(w, context.Errors); err != nil {
+				ctxu.GetLogger(context).Errorf("error serving error json: %v (from %v)", err, context.Errors)
+			}
 		}
 	})
 }
 
-func (app *App) logError(context context.Context, errors v2.Errors) {
-	for _, e := range errors.Errors {
-		c := ctxu.WithValue(context, "err.code", e.Code)
-		c = ctxu.WithValue(c, "err.message", e.Message)
-		c = ctxu.WithValue(c, "err.detail", e.Detail)
+func (app *App) logError(context context.Context, errors errcode.Errors) {
+	for _, e1 := range errors {
+		var c ctxu.Context
+
+		switch e1.(type) {
+		case errcode.Error:
+			e, _ := e1.(errcode.Error)
+			c = ctxu.WithValue(context, "err.code", e.Code)
+			c = ctxu.WithValue(c, "err.message", e.Code.Message())
+			c = ctxu.WithValue(c, "err.detail", e.Detail)
+		case errcode.ErrorCode:
+			e, _ := e1.(errcode.ErrorCode)
+			c = ctxu.WithValue(context, "err.code", e)
+			c = ctxu.WithValue(c, "err.message", e.Message())
+		default:
+			// just normal go 'error'
+			c = ctxu.WithValue(context, "err.code", errcode.ErrorCodeUnknown)
+			c = ctxu.WithValue(c, "err.message", e1.Error())
+		}
+
 		c = ctxu.WithLogger(c, ctxu.GetLogger(c,
 			"err.code",
 			"err.message",
@@ -428,26 +489,24 @@ func (app *App) authorized(w http.ResponseWriter, r *http.Request, context *Cont
 			// base route is accessed. This section prevents us from making
 			// that mistake elsewhere in the code, allowing any operation to
 			// proceed.
-			w.Header().Set("Content-Type", "application/json; charset=utf-8")
-			w.WriteHeader(http.StatusForbidden)
-
-			var errs v2.Errors
-			errs.Push(v2.ErrorCodeUnauthorized)
-			serveJSON(w, errs)
+			if err := errcode.ServeJSON(w, v2.ErrorCodeUnauthorized); err != nil {
+				ctxu.GetLogger(context).Errorf("error serving error json: %v (from %v)", err, context.Errors)
+			}
 			return fmt.Errorf("forbidden: no repository name")
 		}
+		accessRecords = appendCatalogAccessRecord(accessRecords, r)
 	}
 
 	ctx, err := app.accessController.Authorized(context.Context, accessRecords...)
 	if err != nil {
 		switch err := err.(type) {
 		case auth.Challenge:
-			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			// Add the appropriate WWW-Auth header
 			err.ServeHTTP(w, r)
 
-			var errs v2.Errors
-			errs.Push(v2.ErrorCodeUnauthorized, accessRecords)
-			serveJSON(w, errs)
+			if err := errcode.ServeJSON(w, v2.ErrorCodeUnauthorized.WithDetail(accessRecords)); err != nil {
+				ctxu.GetLogger(context).Errorf("error serving error json: %v (from %v)", err, context.Errors)
+			}
 		default:
 			// This condition is a potential security problem either in
 			// the configuration or whatever is backing the access
@@ -481,7 +540,8 @@ func (app *App) eventBridge(ctx *Context, r *http.Request) notifications.Listene
 // nameRequired returns true if the route requires a name.
 func (app *App) nameRequired(r *http.Request) bool {
 	route := mux.CurrentRoute(r)
-	return route == nil || route.GetName() != v2.RouteNameBase
+	routeName := route.GetName()
+	return route == nil || (routeName != v2.RouteNameBase && routeName != v2.RouteNameCatalog)
 }
 
 // apiBase implements a simple yes-man for doing overall checks against the
@@ -531,6 +591,26 @@ func appendAccessRecords(records []auth.Access, method string, repo string) []au
 	return records
 }
 
+// Add the access record for the catalog if it's our current route
+func appendCatalogAccessRecord(accessRecords []auth.Access, r *http.Request) []auth.Access {
+	route := mux.CurrentRoute(r)
+	routeName := route.GetName()
+
+	if routeName == v2.RouteNameCatalog {
+		resource := auth.Resource{
+			Type: "registry",
+			Name: "catalog",
+		}
+
+		accessRecords = append(accessRecords,
+			auth.Access{
+				Resource: resource,
+				Action:   "*",
+			})
+	}
+	return accessRecords
+}
+
 // applyRegistryMiddleware wraps a registry instance with the configured middlewares
 func applyRegistryMiddleware(registry distribution.Namespace, middlewares []configuration.Middleware) (distribution.Namespace, error) {
 	for _, mw := range middlewares {
@@ -568,26 +648,82 @@ func applyStorageMiddleware(driver storagedriver.StorageDriver, middlewares []co
 	return driver, nil
 }
 
+// uploadPurgeDefaultConfig provides a default configuration for upload
+// purging to be used in the absence of configuration in the
+// confifuration file
+func uploadPurgeDefaultConfig() map[interface{}]interface{} {
+	config := map[interface{}]interface{}{}
+	config["enabled"] = true
+	config["age"] = "168h"
+	config["interval"] = "24h"
+	config["dryrun"] = false
+	return config
+}
+
+func badPurgeUploadConfig(reason string) {
+	panic(fmt.Sprintf("Unable to parse upload purge configuration: %s", reason))
+}
+
 // startUploadPurger schedules a goroutine which will periodically
 // check upload directories for old files and delete them
-func startUploadPurger(storageDriver storagedriver.StorageDriver, log ctxu.Logger) {
-	rand.Seed(time.Now().Unix())
-	jitter := time.Duration(rand.Int()%60) * time.Minute
+func startUploadPurger(ctx context.Context, storageDriver storagedriver.StorageDriver, log ctxu.Logger, config map[interface{}]interface{}) {
+	if config["enabled"] == false {
+		return
+	}
 
-	// Start with reasonable defaults
-	// TODO:(richardscothern) make configurable
-	purgeAge := time.Duration(7 * 24 * time.Hour)
-	timeBetweenPurges := time.Duration(1 * 24 * time.Hour)
+	var purgeAgeDuration time.Duration
+	var err error
+	purgeAge, ok := config["age"]
+	if ok {
+		ageStr, ok := purgeAge.(string)
+		if !ok {
+			badPurgeUploadConfig("age is not a string")
+		}
+		purgeAgeDuration, err = time.ParseDuration(ageStr)
+		if err != nil {
+			badPurgeUploadConfig(fmt.Sprintf("Cannot parse duration: %s", err.Error()))
+		}
+	} else {
+		badPurgeUploadConfig("age missing")
+	}
+
+	var intervalDuration time.Duration
+	interval, ok := config["interval"]
+	if ok {
+		intervalStr, ok := interval.(string)
+		if !ok {
+			badPurgeUploadConfig("interval is not a string")
+		}
+
+		intervalDuration, err = time.ParseDuration(intervalStr)
+		if err != nil {
+			badPurgeUploadConfig(fmt.Sprintf("Cannot parse interval: %s", err.Error()))
+		}
+	} else {
+		badPurgeUploadConfig("interval missing")
+	}
+
+	var dryRunBool bool
+	dryRun, ok := config["dryrun"]
+	if ok {
+		dryRunBool, ok = dryRun.(bool)
+		if !ok {
+			badPurgeUploadConfig("cannot parse dryrun")
+		}
+	} else {
+		badPurgeUploadConfig("dryrun missing")
+	}
 
 	go func() {
+		rand.Seed(time.Now().Unix())
+		jitter := time.Duration(rand.Int()%60) * time.Minute
 		log.Infof("Starting upload purge in %s", jitter)
 		time.Sleep(jitter)
 
 		for {
-			storage.PurgeUploads(storageDriver, time.Now().Add(-purgeAge), true)
-			log.Infof("Starting upload purge in %s", timeBetweenPurges)
-			time.Sleep(timeBetweenPurges)
+			storage.PurgeUploads(ctx, storageDriver, time.Now().Add(-purgeAgeDuration), !dryRunBool)
+			log.Infof("Starting upload purge in %s", intervalDuration)
+			time.Sleep(intervalDuration)
 		}
 	}()
-
 }

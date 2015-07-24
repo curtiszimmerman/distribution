@@ -1,3 +1,15 @@
+<!--[metadata]>
++++
+title = "Docker Registry v2 Authentication"
+description = "Introduces the Docker Registry v2 authentication"
+keywords = ["registry, images, repository, v2,  authentication"]
+[menu.main]
+parent="smn_registry_ref"
++++
+<![end-metadata]-->
+
+
+
 # Docker Registry v2 authentication via central service
 
 Today a Docker Registry can run in standalone mode in which there are no

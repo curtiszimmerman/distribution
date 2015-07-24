@@ -6,16 +6,15 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/docker/distribution/registry/storage/cache"
-
 	"github.com/docker/distribution"
+	"github.com/docker/distribution/context"
 	"github.com/docker/distribution/digest"
 	"github.com/docker/distribution/manifest"
+	"github.com/docker/distribution/registry/storage/cache/memory"
 	"github.com/docker/distribution/registry/storage/driver"
 	"github.com/docker/distribution/registry/storage/driver/inmemory"
 	"github.com/docker/distribution/testutil"
 	"github.com/docker/libtrust"
-	"golang.org/x/net/context"
 )
 
 type manifestStoreTestEnv struct {
@@ -30,7 +29,7 @@ type manifestStoreTestEnv struct {
 func newManifestStoreTestEnv(t *testing.T, name, tag string) *manifestStoreTestEnv {
 	ctx := context.Background()
 	driver := inmemory.New()
-	registry := NewRegistryWithDriver(driver, cache.NewInMemoryLayerInfoCache())
+	registry := NewRegistryWithDriver(ctx, driver, memory.NewInMemoryBlobDescriptorCacheProvider())
 
 	repo, err := registry.Repository(ctx, name)
 	if err != nil {
@@ -49,7 +48,11 @@ func newManifestStoreTestEnv(t *testing.T, name, tag string) *manifestStoreTestE
 
 func TestManifestStorage(t *testing.T) {
 	env := newManifestStoreTestEnv(t, "foo/bar", "thetag")
-	ms := env.repository.Manifests()
+	ctx := context.Background()
+	ms, err := env.repository.Manifests(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	exists, err := ms.ExistsByTag(env.tag)
 	if err != nil {
@@ -98,30 +101,43 @@ func TestManifestStorage(t *testing.T) {
 		t.Fatalf("unexpected error generating private key: %v", err)
 	}
 
-	sm, err := manifest.Sign(&m, pk)
-	if err != nil {
+	sm, merr := manifest.Sign(&m, pk)
+	if merr != nil {
 		t.Fatalf("error signing manifest: %v", err)
 	}
 
 	err = ms.Put(sm)
 	if err == nil {
-		t.Fatalf("expected errors putting manifest")
+		t.Fatalf("expected errors putting manifest with full verification")
 	}
 
-	// TODO(stevvooe): We expect errors describing all of the missing layers.
+	switch err := err.(type) {
+	case distribution.ErrManifestVerification:
+		if len(err) != 2 {
+			t.Fatalf("expected 2 verification errors: %#v", err)
+		}
+
+		for _, err := range err {
+			if _, ok := err.(distribution.ErrManifestBlobUnknown); !ok {
+				t.Fatalf("unexpected error type: %v", err)
+			}
+		}
+	default:
+		t.Fatalf("unexpected error verifying manifest: %v", err)
+	}
 
 	// Now, upload the layers that were missing!
 	for dgst, rs := range testLayers {
-		upload, err := env.repository.Layers().Upload()
+		wr, err := env.repository.Blobs(env.ctx).Create(env.ctx)
 		if err != nil {
 			t.Fatalf("unexpected error creating test upload: %v", err)
 		}
 
-		if _, err := io.Copy(upload, rs); err != nil {
+		if _, err := io.Copy(wr, rs); err != nil {
 			t.Fatalf("unexpected error copying to upload: %v", err)
 		}
 
-		if _, err := upload.Finish(dgst); err != nil {
+		if _, err := wr.Commit(env.ctx, distribution.Descriptor{Digest: dgst}); err != nil {
 			t.Fatalf("unexpected error finishing upload: %v", err)
 		}
 	}
